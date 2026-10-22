@@ -1,0 +1,734 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>How my bot followed 15 humans on GitHub (and rejected torvalds)</title>
+<style>
+  html,body{margin:0;background:#0b0d10;display:grid;place-items:center;height:100vh}
+  canvas{width:min(100vw,100vh);height:auto;max-height:100vh}
+</style>
+</head>
+<body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script>
+// Zero-asset canvas film. draw(frame) is a pure function of the frame number.
+// Facts shown are from the real run of 2026-10-22 (scripts/gh_follow_vetter.py,
+// follow-vetting-report.json): 214 candidates, 25.6s, 37.5 req/s sustained,
+// 959 API calls, 0 throttles, ~4.5 calls/candidate, 5000/hr budget, 30% mutual
+// gate, 92-day activity window, 15/15 followed with HTTP 204 at 2.2s spacing.
+// Controls verified: torvalds (follows nobody), sindresorhus (3.3% mutual),
+// yyx990803 (inactive 242 days).
+const W = 1920, H = 1080, FPS = 30, DUR = 48, FRAMES = FPS * DUR;
+const cv = document.getElementById('c');
+cv.width = W; cv.height = H;
+let ctx = cv.getContext('2d');
+
+// LOOK: GitHub-dark screen UI drawn in ink on engineering graph paper.
+const PAPER = '#15181c', INK = '#e6e2d8', GREEN = '#3fb950', AMBER = '#d29922',
+      RED = '#f85149', BLUE = '#58a6ff', PANEL = '#0d1117', EDGE = '#3a4149',
+      MUT = '#8b949e', SHADOW = 'rgba(0,0,0,0.35)';
+const LOOK = {
+  ground: 'grain',
+  wobble: 1,
+  boil: 4,
+  font: '600 {s}px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+  labelStyle: 'tag',
+  guideColor: MUT,
+};
+
+// ---------- math ----------
+const clamp = (x, a = 0, b = 1) => Math.max(a, Math.min(b, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const ease = t => { t = clamp(t); return t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; };
+const easeOut = t => 1 - Math.pow(1 - clamp(t), 3);
+const back = t => { t = clamp(t); const c = 1.7; return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2); };
+const prog = (t, a, b) => clamp((t - a) / (b - a));
+
+function hash2(a, b) {
+  let n = Math.imul(a | 0, 374761393) + Math.imul(b | 0, 668265263);
+  n = Math.imul(n ^ (n >>> 13), 1274126177);
+  return ((n ^ (n >>> 16)) >>> 0) / 4294967295;
+}
+function vnoise(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  return lerp(lerp(hash2(xi, yi), hash2(xi + 1, yi), u), lerp(hash2(xi, yi + 1), hash2(xi + 1, yi + 1), u), v);
+}
+function rng(seed) { let a = seed | 0; return () => { a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+// ---------- hand-drawn primitives ----------
+let BOIL = 0;
+let SHADOWING = false;
+
+function jit(x, y, seed, amp) {
+  const s = seed * 13.37;
+  return [
+    x + (vnoise(x * .012 + s, y * .012) - .5) * 2 * amp + (vnoise(x * .09 + s, y * .09 + 7) - .5) * amp * .6,
+    y + (vnoise(x * .012, y * .012 + s + 50) - .5) * 2 * amp + (vnoise(x * .09 + 3, y * .09 + s) - .5) * amp * .6,
+  ];
+}
+function resample(pts, step = 9, closed = false) {
+  const out = [], P = closed ? [...pts, pts[0]] : pts;
+  for (let i = 0; i < P.length - 1; i++) {
+    const [x0, y0] = P[i], [x1, y1] = P[i + 1], n = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / step));
+    for (let k = 0; k < n; k++) out.push([lerp(x0, x1, k / n), lerp(y0, y1, k / n)]);
+  }
+  if (!closed) out.push(P[P.length - 1]);
+  return out;
+}
+function tracePath(pts, closed) {
+  ctx.beginPath();
+  if (pts.length < 3) { ctx.moveTo(...pts[0]); pts.slice(1).forEach(p => ctx.lineTo(...p)); if (closed) ctx.closePath(); return; }
+  const P = closed ? [...pts, pts[0], pts[1]] : pts;
+  ctx.moveTo(...(closed ? [(P[0][0] + P[1][0]) / 2, (P[0][1] + P[1][1]) / 2] : P[0]));
+  for (let i = 1; i < P.length - 1; i++) ctx.quadraticCurveTo(P[i][0], P[i][1], (P[i][0] + P[i + 1][0]) / 2, (P[i][1] + P[i + 1][1]) / 2);
+  if (!closed) ctx.lineTo(...P[P.length - 1]); else ctx.closePath();
+}
+const J = (pts, seed, amp) => pts.map(([x, y]) => jit(x, y, BOIL + seed, amp * LOOK.wobble));
+
+function ink(pts, o = {}) {
+  const { w = 4, col = INK, closed = false, amp = 2, seed = 0, passes = LOOK.wobble ? 2 : 1, alpha = 1 } = o;
+  ctx.save(); ctx.lineCap = ctx.lineJoin = 'round';
+  for (let p = 0; p < passes; p++) {
+    ctx.globalAlpha = alpha * (p ? .45 : 1);
+    ctx.strokeStyle = SHADOWING ? SHADOW : col;
+    ctx.lineWidth = w * (p ? .55 : 1);
+    tracePath(J(pts, seed + p * .41, amp * (p ? 1.4 : 1)), closed);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function fill(pts, col, o = {}) {
+  const { amp = 1.6, seed = 0, alpha = 1 } = o;
+  ctx.save(); ctx.globalAlpha = alpha; ctx.fillStyle = SHADOWING ? SHADOW : col;
+  tracePath(J(pts, seed + .2, amp), true); ctx.fill(); ctx.restore();
+}
+function hatch(pts, o = {}) {
+  if (SHADOWING) return;
+  const { angle = -0.9, gap = 11, col = INK, w = 1.6, alpha = .35, seed = 0 } = o;
+  const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+  const cx = (Math.min(...xs) + Math.max(...xs)) / 2, cy = (Math.min(...ys) + Math.max(...ys)) / 2;
+  const R = Math.hypot(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)) / 2 + 10;
+  ctx.save(); tracePath(J(pts, seed, 1.5), true); ctx.clip();
+  ctx.translate(cx, cy); ctx.rotate(angle);
+  ctx.strokeStyle = col; ctx.lineWidth = w; ctx.globalAlpha = alpha; ctx.lineCap = 'round';
+  for (let y = -R, i = 0; y < R; y += gap, i++) {
+    const a = hash2(i, BOIL + seed * 7) * 4 - 2, b = hash2(i + 99, BOIL + seed * 7) * 4 - 2;
+    ctx.beginPath(); ctx.moveTo(-R, y + a); ctx.quadraticCurveTo(0, y + (a + b), R, y + b); ctx.stroke();
+  }
+  ctx.restore();
+}
+function withShadow(fn, dx = 9, dy = 9) {
+  ctx.save(); ctx.translate(dx, dy); SHADOWING = true; fn(); SHADOWING = false; ctx.restore(); fn();
+}
+
+// shapes
+const circle = (cx, cy, r, ry = r, rot = 0) => {
+  const n = Math.max(20, Math.round(Math.max(r, ry) * .45)), out = [];
+  for (let i = 0; i < n; i++) { const a = i / n * Math.PI * 2, x = Math.cos(a) * r, y = Math.sin(a) * ry;
+    out.push([cx + x * Math.cos(rot) - y * Math.sin(rot), cy + x * Math.sin(rot) + y * Math.cos(rot)]); }
+  return out;
+};
+const rect = (x, y, w, h) => resample([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], 12, true);
+const line = (x0, y0, x1, y1) => resample([[x0, y0], [x1, y1]], 10);
+const arc = (cx, cy, r, a0, a1, ry = r) => { const n = Math.max(8, Math.round(Math.abs(a1 - a0) * r / 9)), o = [];
+  for (let i = 0; i <= n; i++) { const a = lerp(a0, a1, i / n); o.push([cx + Math.cos(a) * r, cy + Math.sin(a) * ry]); } return o; };
+const roundRect = (x, y, w, h, r) => resample([
+  ...arc(x + w - r, y + r, r, -Math.PI / 2, 0), ...arc(x + w - r, y + h - r, r, 0, Math.PI / 2),
+  ...arc(x + r, y + h - r, r, Math.PI / 2, Math.PI), ...arc(x + r, y + r, r, Math.PI, Math.PI * 1.5)], 10, true);
+
+// labels
+const FONT = LOOK.font;
+function label(text, x, y, o = {}) {
+  const { size = 40, bg = EDGE, fg = INK, p = 1, align = 'left', rot = LOOK.labelStyle === 'tag' ? -0.012 : 0, seed = 3, style = LOOK.labelStyle } = o;
+  if (p <= 0) return;
+  ctx.save(); ctx.font = FONT.replace('{s}', size);
+  const n = Math.round(text.length * clamp((p - .1) / .9)), shown = text.slice(0, n);
+  const full = ctx.measureText(text).width, padX = size * .45, h = size * 1.45;
+  const w = Math.max(size, ctx.measureText(shown).width) + padX * 2;
+  const x0 = align === 'center' ? x - (full + padX * 2) / 2 : align === 'right' ? x - w : x;
+  ctx.translate(x0 + w / 2, y); ctx.rotate(rot); ctx.translate(-(x0 + w / 2), -y);
+  const sc = easeOut(p * 3);
+  ctx.translate(x0, y); ctx.scale(1, sc); ctx.translate(-x0, -y);
+  if (style === 'tag') { const box = rect(x0, y - h / 2, w, h); withShadow(() => fill(box, bg, { seed }), 6, 6); }
+  else if (style === 'pill') { ctx.fillStyle = bg; ctx.beginPath(); ctx.roundRect(x0, y - h / 2, w, h, h / 2); ctx.fill(); }
+  else if (style === 'underline') { ctx.fillStyle = bg; ctx.fillRect(x0 + padX, y + size * .55, w - padX * 2, Math.max(2, size * .08)); }
+  ctx.fillStyle = style === 'plain' || style === 'underline' ? (o.fg || INK) : fg; ctx.textBaseline = 'middle';
+  ctx.fillText(shown, x0 + padX, y + 1);
+  ctx.restore();
+}
+function note(text, x, y, o = {}) {
+  const { size = 26, col = INK, align = 'center', alpha = 1 } = o;
+  ctx.save(); ctx.globalAlpha = alpha; ctx.font = FONT.replace('{s}', size); ctx.fillStyle = col;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillText(text, x, y); ctx.restore();
+}
+function mono(text, x, y, o = {}) { // plain monospace text, left-aligned, no box
+  const { size = 24, col = INK, align = 'left', alpha = 1, p = 1 } = o;
+  if (p <= 0) return;
+  ctx.save(); ctx.globalAlpha = alpha; ctx.font = FONT.replace('{s}', size); ctx.fillStyle = col;
+  ctx.textAlign = align; ctx.textBaseline = 'middle';
+  const n = Math.round(text.length * clamp((p - .1) / .9));
+  ctx.fillText(text.slice(0, n), x, y); ctx.restore();
+}
+function drawOn(pts, p, o = {}) {
+  const n = Math.max(2, Math.round(pts.length * clamp(p)));
+  if (p > 0) ink(pts.slice(0, n), o);
+}
+
+// guide/glow/flat
+function flatMass(pts, col, o = {}) {
+  const { alpha = 1, shade = .18 } = o;
+  ctx.save(); ctx.globalAlpha = alpha; ctx.fillStyle = col; ctx.beginPath(); ctx.moveTo(...pts[0]); for (const p of pts.slice(1)) ctx.lineTo(...p); ctx.closePath(); ctx.fill();
+  if (shade) { const [x0, y0, x1, y1] = bbox(pts); ctx.clip(); ctx.fillStyle = `rgba(0,0,0,${shade})`; ctx.fillRect(x0 + (x1 - x0) * .7, y0, (x1 - x0) * .32, y1 - y0); }
+  ctx.restore();
+}
+function guide(pts, t0, t, o = {}) {
+  const a = (o.alpha ?? .7) * (1 - prog(t, t0 + .25, t0 + .6)); if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha = a; ctx.strokeStyle = o.col || LOOK.guideColor; ctx.lineWidth = 1.4 * PX; ctx.setLineDash([6 * PX, 5 * PX]);
+  ctx.beginPath(); ctx.moveTo(...pts[0]); for (const p of pts.slice(1)) ctx.lineTo(...p); if (o.closed !== false) ctx.closePath(); ctx.stroke(); ctx.restore();
+}
+function glow(x, y, r, rgb, a) {
+  ctx.save(); const g = ctx.createRadialGradient(x, y, 0, x, y, r); g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`); ctx.fillStyle = g; ctx.fillRect(x - r, y - r, 2 * r, 2 * r); ctx.restore();
+}
+const bbox = pts => { const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]); return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)]; };
+
+// ---------- camera + layout ----------
+let PX = 1;
+function withCamera(cam, fn) {
+  ctx.save(); ctx.translate(W / 2, H / 2); ctx.scale(cam.k, cam.k); ctx.translate(-cam.cx, -cam.cy); const px = PX; PX = 1 / cam.k;
+  fn(); PX = px; ctx.restore();
+}
+let LAYOUT = [];
+function claim(id, kind, x, y, w, h) {
+  const m = ctx.getTransform(), P = [[x, y], [x + w, y], [x, y + h], [x + w, y + h]].map(([a, c]) => [m.a * a + m.c * c + m.e, m.b * a + m.d * c + m.f]);
+  const xs = P.map(p => p[0]), ys = P.map(p => p[1]); LAYOUT.push({ id, kind, x: Math.min(...xs), y: Math.min(...ys), w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys) });
+}
+function placeFree(w, h, candidates) {
+  const free = ([x, y]) => LAYOUT.every(o => x + w <= o.x || o.x + o.w <= x || y + h <= o.y || o.y + o.h <= y);
+  return candidates.find(free) || candidates[0];
+}
+
+// ---------- paper: dark engineering graph ----------
+const paper = document.createElement('canvas'); paper.width = W; paper.height = H;
+(() => {
+  const p = paper.getContext('2d'), r = rng(11);
+  p.fillStyle = PAPER; p.fillRect(0, 0, W, H);
+  p.strokeStyle = 'rgba(120,150,200,0.07)'; p.lineWidth = 1;
+  for (let x = 0; x <= W; x += 48) { p.beginPath(); p.moveTo(x, 0); p.lineTo(x, H); p.stroke(); }
+  for (let y = 0; y <= H; y += 48) { p.beginPath(); p.moveTo(0, y); p.lineTo(W, y); p.stroke(); }
+  p.strokeStyle = 'rgba(120,150,200,0.12)';
+  for (let x = 0; x <= W; x += 240) { p.beginPath(); p.moveTo(x, 0); p.lineTo(x, H); p.stroke(); }
+  for (let y = 0; y <= H; y += 240) { p.beginPath(); p.moveTo(0, y); p.lineTo(W, y); p.stroke(); }
+  for (let i = 0; i < 60000; i++) { p.fillStyle = r() < .5 ? 'rgba(0,0,0,0.10)' : 'rgba(200,220,255,0.03)';
+    p.fillRect(r() * W, r() * H, 1 + r() * 1.5, 1 + r() * 1.5); }
+  const g = p.createRadialGradient(W / 2, H / 2, W * .3, W / 2, H / 2, W * .8);
+  g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,0.35)'); p.fillStyle = g; p.fillRect(0, 0, W, H);
+})();
+
+// ================= CHARACTER: the bot =================
+// bot(cx, cy, r, opts): cy is the body centre; feet rest at cy + r*1.18.
+// poses: idle | wave | type | point | celebrate ; eyes: open | happy | wide | closed
+// mouth: smile | flat | o | sad ; mug: draws a coffee mug in the right hand.
+function bot(cx, cy, r, o = {}) {
+  const { pose = 'idle', eyes = 'open', mouth = 'smile', lookX = 0, lookY = 0, mug = false, t = 0 } = o;
+  const breathe = Math.sin(t * 2.1) * r * .015;
+  const by = cy + breathe;
+  // arm angle table (radians): endpoints = shoulder + (cos A, sin A) * r * .66
+  const ARM = {
+    idle: [2.75, 0.39], wave: [2.75, -1.05], type: [1.35, 0.45],
+    point: [2.75, 0.06], celebrate: [-2.25, -0.89],
+  };
+  const [AL, AR] = ARM[pose] || ARM.idle;
+  const shY = by - r * .08, shL = [cx - r * .86, shY], shR = [cx + r * .86, shY];
+  const handL = [shL[0] + Math.cos(AL) * r * .66, shL[1] + Math.sin(AL) * r * .66];
+  const handR = [shR[0] + Math.cos(AR) * r * .66, shR[1] + Math.sin(AR) * r * .66];
+  // feet first (rest on floor)
+  for (const s of [-1, 1]) {
+    fill(circle(cx + s * r * .42, by + r * 1.12, r * .2, r * .13), '#2a2f36', { seed: 5 + s });
+    ink(circle(cx + s * r * .42, by + r * 1.12, r * .2, r * .13), { w: 2.6, col: EDGE, seed: 5 + s, passes: 1 });
+  }
+  // arms behind body edge
+  for (const [sh, hand] of [[shL, handL], [shR, handR]]) {
+    ink([sh, hand], { w: r * .16, col: '#c9c4b8', amp: 1, passes: 1 });
+    fill(circle(hand[0], hand[1], r * .13), '#c9c4b8', { seed: 9 });
+    ink(circle(hand[0], hand[1], r * .13), { w: 2.4, col: EDGE, seed: 9, passes: 1 });
+  }
+  // body
+  const body = circle(cx, by, r, r * .94);
+  withShadow(() => fill(body, PANEL, { seed: 1 }), 7, 9);
+  fill(body, PANEL, { seed: 1 });
+  ink(body, { w: 4.2, col: EDGE, seed: 1 });
+  hatch(circle(cx, by + r * .55, r * .72, r * .3), { col: MUT, alpha: .18, gap: 9, seed: 2 });
+  // antenna (attached to body top)
+  const sway = Math.sin(t * 3.2) * r * .06;
+  const aTop = [cx + sway, by - r * 1.42];
+  ink([[cx, by - r * .88], [cx + sway * .4, by - r * 1.15], aTop], { w: 3.4, col: EDGE, amp: 1 });
+  fill(circle(aTop[0], aTop[1], r * .13), AMBER, { seed: 4 });
+  ink(circle(aTop[0], aTop[1], r * .13), { w: 2.4, col: '#8a6d1d', seed: 4, passes: 1 });
+  // face panel
+  const fw = r * 1.06, fh = r * .78, fx = cx - fw / 2, fy = by - r * .62;
+  const panel = roundRect(fx, fy, fw, fh, r * .18);
+  fill(panel, '#05070a', { seed: 6, amp: 1 });
+  ink(panel, { w: 3, col: EDGE, seed: 6, passes: 1 });
+  // eyes (glow dots, lookX/lookY offset)
+  const ex = r * .26, ey = fy + fh * .38;
+  for (const s of [-1, 1]) {
+    glow(cx + s * ex + lookX * r * .06, ey + lookY * r * .06, r * .2, '63,185,80', .5);
+    if (eyes === 'closed') ink([[cx + s * ex - r * .1, ey], [cx + s * ex + r * .1, ey]], { w: 3, col: GREEN, amp: .6, passes: 1 });
+    else if (eyes === 'happy') { ctx.save(); ctx.strokeStyle = GREEN; ctx.lineWidth = 3.4; ctx.lineCap = 'round'; ctx.beginPath(); ctx.arc(cx + s * ex + lookX * r * .06, ey + r * .05, r * .09, Math.PI * 1.15, Math.PI * 1.85); ctx.stroke(); ctx.restore(); }
+    else fill(circle(cx + s * ex + lookX * r * .06, ey + lookY * r * .06, r * .075, r * .095), GREEN, { amp: .5, seed: 8 + s });
+  }
+  // mouth
+  const my = fy + fh * .74;
+  ctx.save(); ctx.strokeStyle = GREEN; ctx.lineWidth = 3; ctx.lineCap = 'round'; ctx.beginPath();
+  if (mouth === 'smile') ctx.arc(cx + lookX * r * .06, my - r * .07, r * .16, .25 * Math.PI, .75 * Math.PI);
+  else if (mouth === 'o') ctx.arc(cx + lookX * r * .06, my, r * .09, 0, 7);
+  else if (mouth === 'sad') ctx.arc(cx + lookX * r * .06, my + r * .12, r * .16, 1.25 * Math.PI, 1.75 * Math.PI);
+  else { ctx.moveTo(cx - r * .12 + lookX * r * .06, my); ctx.lineTo(cx + r * .12 + lookX * r * .06, my); }
+  ctx.stroke(); ctx.restore();
+  // mug in right hand
+  if (mug) {
+    const mx = handR[0], myy = handR[1];
+    fill(rect(mx - r * .12, myy - r * .2, r * .24, r * .26), '#2a2f36', { seed: 12, amp: .8 });
+    ink(rect(mx - r * .12, myy - r * .2, r * .24, r * .26), { w: 2.4, col: EDGE, seed: 12, passes: 1 });
+    ink(arc(mx + r * .14, myy - r * .07, r * .09, -1.2, 1.2), { w: 2.6, col: EDGE, amp: .6, passes: 1 });
+    const sw = t * 2;
+    ink([[mx, myy - r * .26], [mx + Math.sin(sw) * 5, myy - r * .38]], { w: 2, col: MUT, amp: 1.4, passes: 1, alpha: .7 });
+  }
+  return { handL, handR, headTop: by - r * 1.42 };
+}
+
+// ================= props =================
+function ghCard(x, y, w, h, o = {}) {
+  const { login = '', stats = [], seed = 1, p = 1, accent = BLUE } = o;
+  if (p <= 0) return;
+  ctx.save(); ctx.globalAlpha = clamp(p);
+  const card = roundRect(x, y, w, h, 12);
+  withShadow(() => fill(card, '#161b22', { seed, amp: 1 }), 8, 10);
+  fill(card, '#161b22', { seed, amp: 1 });
+  ink(card, { w: 3.4, col: EDGE, seed, passes: 1 });
+  fill(circle(x + 26, y + 30, 13), '#24292f', { seed: seed + 3, amp: .8 });
+  ink(circle(x + 26, y + 30, 13), { w: 2.4, col: accent, seed: seed + 3, passes: 1 });
+  mono(login, x + 48, y + 30, { size: 24, col: accent, p });
+  stats.forEach((s, i) => mono(s, x + 26, y + 72 + i * 34, { size: 22, col: MUT, p }));
+  ctx.restore();
+  claim('card' + x, 'keep', x, y, w, h);
+}
+function stamp(x, y, p, col) { // red X of rejection
+  if (p <= 0) return;
+  const s = 26 * back(clamp(p));
+  ctx.save(); ctx.globalAlpha = clamp(p); ctx.strokeStyle = col; ctx.lineWidth = 9; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x - s, y - s); ctx.lineTo(x + s, y + s); ctx.moveTo(x + s, y - s); ctx.lineTo(x - s, y + s); ctx.stroke(); ctx.restore();
+}
+function chip(txt, x, y, o = {}) {
+  const { size = 26, bg = '#161b22', fg = INK, p = 1, seed = 5 } = o;
+  label(txt, x, y, { size, bg, fg, p, seed, align: 'left' });
+  ctx.save(); ctx.font = FONT.replace('{s}', size);
+  const w = ctx.measureText(txt).width + size * .9;
+  ctx.restore();
+  if (p > 0) claim('chip' + x + y, 'text', x, y - size * .72, w, size * 1.45);
+  return w;
+}
+function arrow(x0, y, x1, p) {
+  if (p <= 0) return;
+  const xx = lerp(x0, x1, easeOut(p));
+  drawOn(line(x0, y, xx, y), p, { w: 5, col: MUT, amp: 1, passes: 1 });
+  if (p > .9) ink([[x1 - 16, y - 10], [x1, y], [x1 - 16, y + 10]], { w: 5, col: MUT, amp: 1, passes: 1 });
+}
+
+// ================= storyboard =================
+const BPM = 120, BEAT = 60 / BPM;
+const CUES_T = [4, 10, 16, 22, 28, 34, 40, 46];           // cuts, all on bar downbeats
+const SECTIONS = [
+  [0, 2, ['pad', 'hat8']],
+  [2, 3, ['pad', 'hat8', 'kick2']],
+  [3, 5, ['pad', 'hat8', 'kick2', 'pluck']],
+  [5, 8, ['pad', 'hat8', 'kick2', 'pluck', 'clap']],
+  [8, 11, []],                                             // break under the controls gag
+  [11, 12, ['pad', 'kick2']],
+  [12, 14, ['pad', 'kick2', 'pluck']],
+  [14, 17, ['pad', 'kick2', 'pluck', 'hat8', 'bass8']],
+  [17, 20, ['pad', 'kick4', 'hat8', 'bass8', 'clap']],
+  [20, 23, ['pad', 'kick4', 'hat8', 'bass8', 'clap', 'lead']],
+  [23, 24, ['padSoft']],
+];
+const EVENTS = [
+  [1.0, 'blip'], [3.0, 'tick'],
+  [4.5, 'whoosh'], [5.5, 'clack'], [6.5, 'clack'], [7.5, 'clack'], [8.6, 'popLow'], [9.3, 'popLow', 1],
+  [10.6, 'switch'], [11.8, 'clank'], [13.0, 'clank'], [14.2, 'clank'], [15.2, 'swish'],
+  [16.8, 'thud'], [18.4, 'clonk'], [20.0, 'thud'], [21.2, 'creak'],
+  ...Array.from({ length: 15 }, (_, i) => [22.8 + i * .32, 'pop', i % 4]),
+  [27.8, 'ding'],
+  [28.6, 'whoosh'], [29.4, 'tick'], [30.2, 'tick'], [31.0, 'tick'], [32.2, 'switch'],
+  [34.8, 'drip'], [36.5, 'drip'], [38.2, 'swish'],
+  [40.6, 'tick'], [41.4, 'tick'], [42.2, 'tick'], [43.0, 'tick'], [44.2, 'flag'],
+  [46.4, 'notify'], [47.1, 'ding'],
+];
+
+// blocking: the bot stands at BOTX; stations around it.
+const BOT = { x: -560, floor: 330 };   // world: y grows downward; floor line y=330
+const CAMS = {
+  s1: t => ({ cx: -260, cy: -40, k: 1.02 + .05 * prog(t, 0, 4) }),
+  s2: t => ({ cx: 300, cy: -60, k: 1.32 + .1 * prog(t, 4, 10) }),
+  s3: t => ({ cx: 300, cy: 0, k: 1.5 + .08 * prog(t, 10, 16) }),
+  s4: t => ({ cx: 0, cy: -30, k: 1.22 + .03 * prog(t, 16, 22) }),
+  s5: t => ({ cx: 60, cy: -110, k: 1.5 + .1 * prog(t, 22, 28) }),
+  s6: t => ({ cx: -490, cy: -20, k: 1.45 }),
+  s7: t => ({ cx: -430, cy: 0, k: 1.5 + .08 * prog(t, 34, 40) }),
+  s8: t => ({ cx: 120, cy: -50, k: 1.12 }),
+  s9: t => ({ cx: -60, cy: -90, k: 1.05 }),
+};
+const SHOTS = [
+  { from: 0, to: 4, cam: CAMS.s1 },
+  { from: 4, to: 10, cam: CAMS.s2 },
+  { from: 10, to: 16, cam: CAMS.s3 },
+  { from: 16, to: 22, cam: CAMS.s4 },
+  { from: 22, to: 28, cam: CAMS.s5 },
+  { from: 28, to: 34, cam: CAMS.s6 },
+  { from: 34, to: 40, cam: CAMS.s7 },
+  { from: 40, to: 46, cam: CAMS.s8 },
+  { from: 46, to: DUR, cam: CAMS.s9 },
+];
+
+// ---------- world: one continuous desk-space ----------
+function world(t) {
+  // floor line
+  ink([[-1400, BOT.floor + 4], [900, BOT.floor + 4]], { w: 3, col: '#2a3138', amp: 1, passes: 1 });
+  // ---- S1: profile card next to the bot (slides out at the S2 cut) ----
+  if (t < 5.5) {
+    const p = prog(t, .4, 1.1);
+    const dx = -560 * prog(t, 4.0, 4.65);   // exit move: gone before S2 settles
+    ghCard(BOT.x + 90 + dx, BOT.floor - 360, 400, 170, { login: 'limitlessprojects', stats: ['followers: 2', 'following: 0'], seed: 1, p, accent: BLUE });
+    if (p > .5) { label('day 1. zero humans.', BOT.x + 100 + dx, BOT.floor - 390, { size: 30, bg: '#2a2f36', fg: INK, p: prog(t, 1.3, 2.0) }); claim('s1cap', 'text', BOT.x + 100 + dx, BOT.floor - 415, 360, 48); }
+  }
+  // the bot itself (always in the world)
+  let pose = 'idle', eyes = 'open', mouth = 'smile', mug = false;
+  if (t > 34 && t < 40) { mug = true; pose = 'idle'; }
+  if (t >= 46) { pose = 'celebrate'; eyes = 'happy'; }
+  if (t > 10 && t < 16) { pose = 'point'; }
+  if (t > 22 && t < 28) { pose = 'type'; }
+  const r = 78;
+  bot(BOT.x, BOT.floor - 118, r, { pose, eyes, mouth, mug, t });
+  // ---- S2: candidate pool conveyor (4-10s) ----
+  if (t >= 3.6 && t < 10) {
+    const p = prog(t, 4, 4.6);
+    const convY = BOT.floor - 260;
+    ink([[40, convY - 60], [40, convY + 40], [880, convY + 40]], { w: 4, col: EDGE, amp: 1, passes: 1 });
+    label('build the pool: seeds', 60, convY - 140, { size: 30, bg: '#1d2430', fg: INK, p: prog(t, 4.2, 5.0) });
+    // rolling cards
+    const names = ['seed: followers', 'seed: stargazers', 'seed: neighbors', 'seed: fork-owners'];
+    for (let i = 0; i < 4; i++) {
+      const tt = (t * .5 + i * .25) % 1;
+      const cxp = lerp(60, 900, tt), alpha = Math.sin(tt * Math.PI);
+      ctx.save(); ctx.globalAlpha = alpha;
+      const card = roundRect(cxp - 90, convY - 105, 180, 62, 10);
+      fill(card, '#161b22', { seed: 20 + i, amp: 1 }); ink(card, { w: 2.6, col: EDGE, seed: 20 + i, passes: 1 });
+      mono(names[i], cxp - 76, convY - 74, { size: 19, col: MUT });
+      ctx.restore();
+    }
+    const n214 = Math.round(214 * prog(t, 5.4, 9.2));
+    if (n214 > 0) label(n214 + ' candidates', 520, convY + 120, { size: 34, bg: '#23301f', fg: GREEN, p: prog(t, 5.4, 5.9) });
+  }
+  // ---- S3: the gauntlet gates (10-16s) ----
+  if (t >= 9.6 && t < 16) {
+    const gx = 140, gy = BOT.floor - 300, gw = 190, gh = 190;
+    const gates = [['mutual', '>= 30%'], ['active', '<= 92d'], ['human?', '']];
+    for (let i = 0; i < 3; i++) {
+      const x = gx + i * 230, p = prog(t, 9.8 + i * .3, 10.3 + i * .3);
+      if (p <= 0) continue;
+      const gate = roundRect(x, gy, gw, gh, 14);
+      withShadow(() => fill(gate, '#10151b', { seed: 30 + i, amp: 1 }), 8, 10);
+      fill(gate, '#10151b', { seed: 30 + i, amp: 1 });
+      ink(gate, { w: 3.6, col: i === 2 ? AMBER : EDGE, seed: 30 + i, passes: 1 });
+      mono(gates[i][0], x + gw / 2, gy + 70, { size: 26, col: INK, align: 'center', p });
+      if (gates[i][1]) mono(gates[i][1], x + gw / 2, gy + 120, { size: 30, col: GREEN, align: 'center', p });
+      else mono('eyeballs', x + gw / 2, gy + 120, { size: 26, col: AMBER, align: 'center', p });
+      claim('gate' + i, 'keep', x, gy, gw, gh);
+    }
+    // flowing cards: some pass, some drop with X
+    for (let i = 0; i < 5; i++) {
+      const t0 = 10.4 + i * .9, dur = 1.5;
+      if (t < t0) break;
+      const k = prog(t, t0, t0 + dur), rejected = i === 1 || i === 3;
+      const y0 = gy + 62, x0 = gx - 120, x1 = gx + 3 * 230 + 140;
+      let cxp = lerp(x0, x1, ease(k)), cyp = y0, rot = 0;
+      if (rejected) { const drop = prog(t, t0 + .75, t0 + 1.4); cyp = y0 + drop * drop * 215; rot = drop * .9; }
+      ctx.save(); ctx.translate(cxp, cyp); ctx.rotate(rot); ctx.translate(-cxp, -cyp);
+      const card = roundRect(cxp - 46, cyp - 26, 92, 52, 8);
+      fill(card, '#161b22', { seed: 40 + i, amp: 1 }); ink(card, { w: 2.4, col: rejected ? RED : EDGE, seed: 40 + i, passes: 1 });
+      ctx.restore();
+      if (rejected && t > t0 + .75) stamp(cxp, cyp - 60, prog(t, t0 + .75, t0 + .95), RED);
+    }
+    if (t > 12) label('bots, ghosts, lurkers: gone', 60, gy + 240, { size: 28, bg: '#301d1d', fg: RED, p: prog(t, 12, 12.6) });
+    const npass = Math.round(28 * prog(t, 13.2, 15.2));
+    if (npass > 0) label(npass + ' pass', 700, gy + 240, { size: 34, bg: '#23301f', fg: GREEN, p: prog(t, 13.2, 13.7) });
+  }
+  // ---- S4: the controls (16-22s) — break section, SFX only ----
+  if (t >= 15.6 && t < 22) {
+    const py = BOT.floor - 300;
+    label('sanity check: the legends', 0, py - 90, { size: 36, bg: '#2a2f36', fg: INK, p: prog(t, 15.8, 16.4), align: 'center' });
+    const rows = [
+      ['torvalds', 'follows nobody', 'mutual gate: fail', 16.6],
+      ['sindresorhus', '12.8k following', 'mutual: 3.3% — fail', 18.2],
+      ['yyx990803', 'last push: 242d ago', 'activity gate: fail', 19.8],
+    ];
+    for (let i = 0; i < 3; i++) {
+      const [login, s1, s2, t0] = rows[i], p = prog(t, t0, t0 + .35);
+      if (p <= 0) continue;
+      const x = -520 + i * 360, y = py + 30;
+      const card = roundRect(x, y, 320, 150, 14);
+      withShadow(() => fill(card, '#161b22', { seed: 50 + i, amp: 1 }), 8, 10);
+      fill(card, '#161b22', { seed: 50 + i, amp: 1 });
+      ink(card, { w: 3.6, col: EDGE, seed: 50 + i, passes: 1 });
+      mono(login, x + 26, y + 40, { size: 28, col: BLUE, p });
+      mono(s1, x + 26, y + 82, { size: 21, col: MUT, p });
+      mono(s2, x + 26, y + 118, { size: 21, col: RED, p: prog(t, t0 + .3, t0 + .6) });
+      stamp(x + 280, y + 40, prog(t, t0 + .38, t0 + .58), RED);
+      claim('ctl' + i, 'keep', x, y, 320, 150);
+    }
+    if (t > 20.6) label('all three fail. correctly.', 0, py + 240, { size: 32, bg: '#23301f', fg: GREEN, p: prog(t, 20.6, 21.2), align: 'center' });
+  }
+  // ---- S5: the follow grid (22-28s) ----
+  if (t >= 21.95 && t < 28) {
+    const gx = -260, gy = BOT.floor - 500, cell = 92, gap = 14;
+    label('follow(follow-backer), 2.2s apart', gx + 130, gy - 40, { size: 30, bg: '#1d2430', fg: INK, p: prog(t, 21.8, 22.4) });
+    for (let i = 0; i < 15; i++) {
+      const t0 = 22.8 + i * .32, p = prog(t, t0, t0 + .3);
+      const col = i % 5, row = Math.floor(i / 5);
+      const x = gx + col * (cell + gap), y = gy + row * (cell + gap);
+      const tile = roundRect(x, y, cell, cell, 12);
+      if (p <= 0) { fill(tile, '#10151b', { seed: 60 + i, amp: .8, alpha: .5 }); ink(tile, { w: 2.2, col: '#22272e', seed: 60 + i, passes: 1 }); continue; }
+      const pop = back(p);
+      ctx.save(); ctx.translate(x + cell / 2, y + cell / 2); ctx.scale(pop, pop); ctx.translate(-x - cell / 2, -y - cell / 2);
+      fill(tile, '#12261a', { seed: 60 + i, amp: .8 });
+      ink(tile, { w: 2.6, col: GREEN, seed: 60 + i, passes: 1 });
+      const ck = [[x + 22, y + 48], [x + 40, y + 66], [x + 72, y + 28]];
+      drawOn(ck, prog(t, t0 + .1, t0 + .4), { w: 6, col: GREEN, amp: .8, passes: 1 });
+      ctx.restore();
+    }
+    const n = Math.min(15, Math.floor((t - 22.8) / .32) + 1);
+    if (n > 0 && t < 27.95) label('following: ' + n, gx + 130, gy + 3 * (cell + gap) + 50, { size: 34, bg: '#23301f', fg: GREEN, p: 1 });
+    if (t >= 27.9) label('15 / 15  ·  HTTP 204 × 15', gx + 200, gy + 3 * (cell + gap) + 50, { size: 34, bg: '#23301f', fg: GREEN, p: prog(t, 27.9, 28.3) });
+  }
+  // ---- S6: telemetry gauge (28-34s) ----
+  if (t >= 27.6 && t < 34) {
+    const cx0 = -700, cy0 = BOT.floor - 300, R = 150;
+    const a0 = Math.PI * 1.15, a1 = Math.PI * 1.85; // top arc, left to right
+    label('throughput, sustained', cx0, cy0 - R - 60, { size: 30, bg: '#1d2430', fg: INK, p: prog(t, 27.8, 28.4), align: 'center' });
+    ink(arc(cx0, cy0, R, a0, a1), { w: 7, col: EDGE, amp: 1, passes: 1 });
+    for (let v = 0; v <= 50; v += 10) {
+      const a = lerp(a0, a1, v / 50);
+      ink([[cx0 + Math.cos(a) * R, cy0 + Math.sin(a) * R], [cx0 + Math.cos(a) * (R - 22), cy0 + Math.sin(a) * (R - 22)]], { w: 3, col: MUT, amp: .6, passes: 1 });
+      mono(String(v), cx0 + Math.cos(a) * (R + 30), cy0 + Math.sin(a) * (R + 30), { size: 18, col: MUT, align: 'center' });
+    }
+    const needleA = lerp(a0, a1, clamp(37.5 / 50) * prog(t, 28.6, 30.2));
+    ink([[cx0, cy0], [cx0 + Math.cos(needleA) * (R - 34), cy0 + Math.sin(needleA) * (R - 34)]], { w: 6, col: RED, amp: .8, passes: 1 });
+    fill(circle(cx0, cy0, 12), '#161b22', { seed: 70, amp: .6 }); ink(circle(cx0, cy0, 12), { w: 2.6, col: EDGE, seed: 70, passes: 1 });
+    if (t > 30.2) label('37.5 req/s', cx0, cy0 + 66, { size: 34, bg: '#301d1d', fg: RED, p: prog(t, 30.2, 30.7), align: 'center' });
+    // chips
+    const chips = [['959 api calls', 30.8], ['0 throttles', 31.6], ['4.5 calls / candidate', 32.2]];
+    chips.forEach(([txt, t0], i) => chip(txt, cx0 + 310, cy0 + 110 + i * 46, { size: 26, bg: '#1d2430', fg: INK, p: prog(t, t0, t0 + .4) }));
+    label('budget: 5000/hr', cx0 + 240, cy0 - R - 60, { size: 26, bg: '#23301f', fg: GREEN, p: prog(t, 31.2, 31.7) });
+  }
+  // ---- S7: verdict with coffee (34-40s) ----
+  if (t >= 33.6 && t < 40) {
+    if (t > 34.4) label('so… was the api the bottleneck?', -430, BOT.floor - 380, { size: 32, bg: '#2a2f36', fg: INK, p: prog(t, 34.4, 35.0), align: 'center' });
+    if (t > 36.2) label('no. 2.2s between follows — on purpose.', -430, BOT.floor - 320, { size: 32, bg: '#23301f', fg: GREEN, p: prog(t, 36.2, 36.8), align: 'center' });
+    if (t > 38.2) mono('politeness was the limiter. github never even noticed.', -430, BOT.floor - 262, { size: 24, col: MUT, align: 'center', p: prog(t, 38.2, 38.9) });
+  }
+  // ---- S8: recap chain (40-46s) ----
+  if (t >= 39.6 && t < 46) {
+    const y = BOT.floor - 240;
+    label('the whole run, 25.6 seconds:', 60, y - 90, { size: 32, bg: '#2a2f36', fg: INK, p: prog(t, 39.8, 40.3) });
+    const steps = [['214 vetted', 40.4], ['28 passed', 41.2], ['15 followed', 42.0], ['204 × 15', 42.8]];
+    steps.forEach(([txt, t0], i) => {
+      const x = -420 + i * 340, p = prog(t, t0, t0 + .4);
+      if (p <= 0) return;
+      const c = roundRect(x, y, 280, 110, 14);
+      withShadow(() => fill(c, '#161b22', { seed: 80 + i, amp: 1 }), 8, 10);
+      fill(c, '#161b22', { seed: 80 + i, amp: 1 }); ink(c, { w: 3.4, col: i === 2 ? GREEN : i === 3 ? AMBER : EDGE, seed: 80 + i, passes: 1 });
+      mono(txt, x + 140, y + 55, { size: 30, col: i === 2 ? GREEN : INK, align: 'center', p });
+      claim('step' + i, 'keep', x, y, 280, 110);
+      if (i < 3) arrow(x + 290, y + 55, x + 330, prog(t, t0 + .2, t0 + .6));
+    });
+    if (t > 43.6) mono('959 calls, zero throttles, 37.5 req/s sustained', 60, y + 170, { size: 26, col: MUT, align: 'left', p: prog(t, 43.6, 44.2) });
+  }
+  // ---- S9: end card (46-48s) ----
+  if (t >= 45.6) {
+    const p = prog(t, 46.0, 46.6);
+    if (p > 0) {
+      label('it followed 15 humans today.', -60, BOT.floor - 430, { size: 40, bg: '#1d2430', fg: INK, p, align: 'center' });
+      label('it rejected torvalds.', -60, BOT.floor - 360, { size: 40, bg: '#301d1d', fg: RED, p: prog(t, 46.5, 47.0), align: 'center' });
+      label('both were correct.', -60, BOT.floor - 290, { size: 40, bg: '#23301f', fg: GREEN, p: prog(t, 47.0, 47.5), align: 'center' });
+    }
+  }
+}
+
+// ---------- character sheet (temp: open page with #charsheet) ----------
+function charSheet() {
+  const poses = ['idle', 'wave', 'type', 'point', 'celebrate'];
+  const eyes = ['open', 'happy', 'wide', 'closed'];
+  poses.forEach((pose, i) => {
+    const x = 300 + i * 340;
+    bot(x, 560, 85, { pose, t: 1 });
+    mono(pose, x, 720, { size: 24, col: MUT, align: 'center' });
+  });
+  eyes.forEach((e, i) => {
+    const x = 380 + i * 320;
+    bot(x, 900, 70, { eyes: e, mouth: e === 'closed' ? 'flat' : 'smile', t: 1 });
+    mono(e, x, 1010, { size: 22, col: MUT, align: 'center' });
+  });
+  bot(1700, 900, 70, { mug: true, t: 1 });
+  mono('mug', 1700, 1010, { size: 22, col: MUT, align: 'center' });
+}
+
+// ---------- draw ----------
+function draw(frame) {
+  const t = frame / FPS;
+  BOIL = LOOK.boil ? Math.floor(frame / LOOK.boil) : 0; LAYOUT = [];
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.filter = 'none'; ctx.globalAlpha = 1;
+  ctx.drawImage(paper, 0, 0);
+  if (location.hash === '#charsheet' || window.__CH) { charSheet(); window.LAYOUT = LAYOUT; return; }
+  const shot = SHOTS.find(s => t >= s.from && t < s.to) || SHOTS[SHOTS.length - 1];
+  withCamera(shot.cam(t), () => world(t));
+  // screen-space title card (first 2s)
+  if (t < 2.6) {
+    const p = prog(t, .15, .7);
+    label('how my bot followed 15 humans', W / 2, 150, { size: 46, bg: '#1d2430', fg: INK, p, align: 'center' });
+    label('(and rejected torvalds)', W / 2, 220, { size: 34, bg: '#301d1d', fg: RED, p: prog(t, .5, 1.0), align: 'center' });
+  }
+  window.LAYOUT = LAYOUT;
+}
+window.draw = draw; window.FRAMES = FRAMES; window.FPS = FPS;
+window.CUES = CUES_T.slice(1);
+// groove.js: a beat-grid score with sections, a break, and a synthesized sound for every action.
+// Paste into the page's <script> (before the live-preview block), then:
+//   window.SCORE = ac => buildGroove(ac, { dur: DUR, bpm: BPM, sections: SECTIONS, events: EVENTS });
+// The picture reads the same BPM / SECTIONS / EVENTS, so sound and image can't drift apart.
+//
+// sections: [[fromBar, toBar, layers], ...]  layers from:
+//   'pad' 'padSoft' 'kick2' 'kick4' 'hat8' 'hat16' 'clap' 'bassHalf' 'bass8' 'lead' 'pluck' 'crash'
+//   A section with [] layers is a break: silence (the SFX still play).
+// events:   [[seconds, sfxName, arg?], ...]  sfxName from the FX table below.
+// kit:      the instrument set, chosen per piece: 'electro' | 'acoustic' | 'keys' | 'percussion'
+// harmony:  a mood from HARMONY below, or your own chords (one per bar, MIDI notes); key: semitone transpose.
+// Choose kit, harmony, key and bpm for THIS piece; don't reuse the last piece's choices.
+// sfxGain: level of the sound effects against the music (lower it if effects drown the downbeats).
+// Layering rule learned the hard way: bring layers in one or two per bar. Kick + bass entering
+// together after a quiet intro jumped +11 dB and read as a startle; staggered, it was +3.5 dB.
+const HARMONY = {
+  bright:  [[60, 64, 67], [65, 69, 72], [67, 71, 74], [60, 64, 67]],          // I IV V I: plain, sunny
+  wistful: [[57, 60, 64], [53, 57, 60], [48, 52, 55], [55, 59, 62]],          // vi IV I V: pop, bittersweet
+  dreamy:  [[60, 64, 67, 71], [62, 66, 69, 72], [60, 64, 67, 71], [55, 59, 62, 66]], // lydian maj7 colour: floating, wonder
+  tense:   [[57, 60, 64], [53, 57, 60], [52, 56, 59], [57, 60, 64]],          // harmonic minor, i VI V i: suspense, mystery
+  folk:    [[62, 66, 69], [67, 71, 74], [62, 66, 69], [57, 61, 64]],          // I IV I V in D: warm, open
+  blues:   [[60, 64, 67, 70], [65, 69, 72, 75], [60, 64, 67, 70], [67, 71, 74, 77]], // dominant 7ths: cheeky, swaggering
+};
+function buildGroove(ac, { dur, bpm = 120, sections, events = [], kit = 'electro', harmony = 'wistful', key = 0, gain = .9, sfxGain = .9 } = {}) {
+  const chords = (Array.isArray(harmony) ? harmony : HARMONY[harmony]).map(c => c.map(m => m + key));
+  const T0 = ac.currentTime + (ac instanceof OfflineAudioContext ? 0 : .05), BEAT = 60 / bpm;
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const out = ac.createDynamicsCompressor(); out.threshold.value = -12; out.ratio.value = 3; out.connect(ac.destination);
+  const master = ac.createGain(); master.gain.value = gain; master.connect(out);
+  const M = ac.createGain(), X = ac.createGain(); M.connect(master); X.connect(master); X.gain.value = sfxGain;
+  const rev = ac.createConvolver(), wet = ac.createGain(); wet.gain.value = .22; rev.connect(wet); wet.connect(master); M.connect(rev); X.connect(rev);
+  { const n = Math.round(ac.sampleRate * 1.6), ir = ac.createBuffer(2, n, ac.sampleRate);          // seeded room: identical every render
+    for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); let s = 99 + c; for (let i = 0; i < n; i++) { s = (s * 1103515245 + 12345) & 0x7fffffff; d[i] = (s / 0x7fffffff * 2 - 1) * Math.pow(1 - i / n, 3); } } rev.buffer = ir; }
+  const noise = (() => { const n = ac.sampleRate, buf = ac.createBuffer(1, n, n), d = buf.getChannelData(0); let s = 7; for (let i = 0; i < n; i++) { s = (s * 1103515245 + 12345) & 0x7fffffff; d[i] = s / 0x7fffffff * 2 - 1; } return buf; })();
+  const env = (g, t, a, peak, decay) => { g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(peak, t + a); g.gain.setTargetAtTime(0, t + a, decay); };
+  function osc(bus, t, type, f, peak, a, decay, f2, glide = .05, pan = 0) {
+    const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(); o.type = type; o.frequency.setValueAtTime(f, t);
+    if (f2) o.frequency.exponentialRampToValueAtTime(f2, t + glide); p.pan.value = pan; env(g, t, a, peak, decay); o.connect(g); g.connect(p); p.connect(bus); o.start(t); o.stop(t + a + decay * 7);
+  }
+  function hiss(bus, t, type, f, q, peak, a, decay, f2, glide = .1, pan = 0) {
+    const s = ac.createBufferSource(), fl = ac.createBiquadFilter(), g = ac.createGain(), p = ac.createStereoPanner(); s.buffer = noise;
+    fl.type = type; fl.frequency.setValueAtTime(f, t); if (f2) fl.frequency.exponentialRampToValueAtTime(f2, t + glide); fl.Q.value = q; p.pan.value = pan;
+    env(g, t, a, peak, decay); s.connect(fl); fl.connect(g); g.connect(p); p.connect(bus); s.start(t, (t * 7.3) % .5); s.stop(t + a + decay * 7);
+  }
+  // instruments, per kit (same roles, different voices)
+  const soft = { electro: 1, acoustic: .7, keys: .45, percussion: .8 }[kit];
+  const kick = (t, a = .9) => kit === 'percussion' ? osc(M, t, 'sine', 130, a * .6, .002, .14, 90, .12)                       // low tom
+    : osc(M, t, 'sine', kit === 'electro' ? 150 : 110, a * soft, .002, kit === 'electro' ? .12 : .09, kit === 'electro' ? 42 : 55, .1);
+  const clap = (t, v = 1) => kit === 'electro' ? (hiss(M, t, 'bandpass', 1500, .9, .5 * v, .002, .06), hiss(M, t + .012, 'bandpass', 1700, .9, .35 * v, .002, .08))
+    : kit === 'acoustic' ? (hiss(M, t, 'bandpass', 1100, 3, .35 * v, .001, .02), osc(M, t, 'triangle', 420, .15 * v, .001, .03))              // rimshot
+    : kit === 'keys' ? hiss(M, t, 'lowpass', 3000, .7, .18 * v, .01, .12)                                                            // brush
+    : (osc(M, t, 'sine', 900, .3 * v, .001, .03), osc(M, t, 'sine', 1400, .15 * v, .001, .02));                                     // woodblock
+  const hat = (t, a = .12) => kit === 'electro' ? hiss(M, t, 'highpass', 7500, .7, a, .001, .025, null, 0, .3)
+    : hiss(M, t, 'bandpass', 6000, 1.2, a * (kit === 'keys' ? .4 : .7), .01, .045, null, 0, .3);                                    // shaker
+  const crash = t => hiss(M, t, 'highpass', 5000, .5, .35 * soft, .002, .6);
+  const bass = (t, m, len) => { const o = ac.createOscillator(), f = ac.createBiquadFilter(), g = ac.createGain();
+    o.type = kit === 'electro' ? 'sawtooth' : kit === 'acoustic' ? 'triangle' : 'sine'; o.frequency.value = hz(m);
+    f.type = 'lowpass'; f.frequency.value = kit === 'electro' ? 520 : 900; const pk = kit === 'percussion' ? .3 : .22;
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(pk, t + .01); g.gain.setTargetAtTime(0, t + (kit === 'percussion' ? .05 : len * .7), kit === 'percussion' ? .08 : .05);
+    o.connect(f); f.connect(g); g.connect(M); o.start(t); o.stop(t + len + .4); };
+  const pluck = (t, m, a = .12, pan = 0) => {
+    if (kit === 'keys') { osc(M, t, 'sine', hz(m), a * 1.1, .004, .5, null, 0, pan); osc(M, t, 'sine', hz(m) * 2.01, a * .35, .002, .18, null, 0, pan); osc(M, t, 'sine', hz(m) * 3.98, a * .12, .001, .06, null, 0, pan); return; }   // electric piano
+    if (kit === 'percussion') { osc(M, t, 'sine', hz(m), a * 1.2, .001, .12, null, 0, pan); osc(M, t, 'sine', hz(m) * 4, a * .3, .001, .03, null, 0, pan); return; }                                  // marimba
+    osc(M, t, 'triangle', hz(m), a, .003, kit === 'acoustic' ? .32 : .18, null, 0, pan); osc(M, t, 'sine', hz(m + 12), a * .3, .003, .08, null, 0, pan); };                                             // pluck / nylon
+  const pad = (t, notes, len, a = .045) => notes.forEach((m, i) => { const o = ac.createOscillator(), g = ac.createGain(), f = ac.createBiquadFilter();
+    o.type = kit === 'keys' ? 'sawtooth' : 'sine'; o.frequency.value = hz(m); o.detune.value = (i - 1) * (kit === 'keys' ? 9 : 6);           // keys: a string section
+    f.type = 'lowpass'; f.frequency.value = kit === 'keys' ? 1400 : 8000; const pk = kit === 'keys' ? a * .5 : a, at = kit === 'keys' ? .7 : .4;
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(pk, t + at); g.gain.setValueAtTime(pk, t + len - .3); g.gain.linearRampToValueAtTime(0, t + len + .2);
+    o.connect(f); f.connect(g); g.connect(M); o.start(t); o.stop(t + len + .3); });
+  const bars = Math.ceil(dur / (4 * BEAT)); let prevL = [];
+  for (let bar = 0; bar < bars; bar++) {
+    const sec = sections.find(([a, e]) => bar >= a && bar < e); if (!sec) { prevL = []; continue; }
+    const L = sec[2], t0 = T0 + bar * 4 * BEAT, ch = chords[bar % chords.length], first = bar === sec[0];
+    // a drum layer's first bar comes in at half strength, so it arrives instead of jumping out
+    const fresh = n => L.includes(n) && !prevL.includes(n) && bar > 0, kv = (fresh('kick4') || fresh('kick2')) && !prevL.some(x => x.startsWith('kick')) ? .5 : 1, cv = fresh('clap') ? .6 : 1;
+    if (L.includes('pad')) pad(t0, ch.map(m => m + 12), 4 * BEAT); if (L.includes('padSoft')) pad(t0, ch.map(m => m + 12), 4 * BEAT, .035);
+    if (L.includes('crash') && first) crash(t0);
+    for (let s = 0; s < 16; s++) { const t = t0 + s * BEAT / 4, on = s % 4 === 0, beat = s / 4;
+      if (L.includes('kick4') && on) kick(t, .9 * kv); if (L.includes('kick2') && (s === 0 || s === 8)) kick(t, .6 * kv);
+      if (L.includes('clap') && (s === 4 || s === 12)) clap(t, cv);
+      if (L.includes('hat8') && s % 2 === 0 && !on) hat(t); if (L.includes('hat16') && !on) hat(t, s % 2 ? .07 : .12);
+      if (L.includes('bassHalf') && (s === 0 || s === 8)) bass(t, ch[0] - 24, 2 * BEAT);
+      if (L.includes('bass8') && s % 2 === 0) bass(t, ch[0] - 24 + (s % 8 === 6 ? 12 : 0), BEAT / 2);
+      if (L.includes('lead')) pluck(t, [ch[0], ch[1], ch[2], ch[1] + 12][s % 4] + 12, .07, s % 2 ? .3 : -.3);
+      if (L.includes('pluck') && on) pluck(t, [ch[2], ch[1], ch[0], ch[1]][beat] + 12, .1);
+    }
+    prevL = L;
+  }
+  // sound effects: one per visible action
+  const FX = {
+    click: t => hiss(X, t, 'highpass', 3000, .7, .09, .001, .012), clack: t => { hiss(X, t, 'bandpass', 2200, 1, .25, .001, .03); osc(X, t, 'sine', 120, .25, .002, .05); },
+    switch: t => hiss(X, t, 'bandpass', 3000, 2, .2, .001, .015),
+    whooshIn: t => hiss(X, t, 'bandpass', 300, 1.2, .3, .35, .25, 3500, .45), whooshOut: t => hiss(X, t, 'bandpass', 3500, 1.2, .25, .3, .25, 300, .45),
+    whoosh: t => hiss(X, t, 'bandpass', 500, 1, .22, .15, .15, 2500, .3),
+    boing: t => { osc(X, t, 'sine', 520, .3, .005, .18, 180, .25); osc(X, t + .02, 'sine', 260, .15, .005, .12); },
+    clank: t => { osc(X, t, 'triangle', 880, .22, .001, .06); osc(X, t, 'triangle', 1318, .12, .001, .05); hiss(X, t, 'bandpass', 4000, 3, .15, .001, .02); },
+    ding: t => { osc(X, t, 'sine', 1568, .22, .002, .35); osc(X, t, 'sine', 2349, .08, .002, .2); },
+    pop: t => osc(X, t, 'sine', 500, .28, .002, .06, 900, .05), popLow: (t, i = 0) => osc(X, t, 'sine', 220 + i * 40, .3, .002, .08, 420 + i * 60, .06, i % 2 ? .4 : -.4),
+    tick: t => { hiss(X, t, 'bandpass', 2600, 4, .22, .001, .02); osc(X, t, 'triangle', 620, .12, .001, .03, 300, .04); },
+    swish: t => hiss(X, t, 'bandpass', 1200, 2, .18, .03, .08, 2500, .12), thud: t => { osc(X, t, 'sine', 110, .5, .002, .12, 40, .12); hiss(X, t, 'lowpass', 400, 1, .2, .002, .06); },
+    clonk: t => { osc(X, t, 'triangle', 330, .25, .001, .07); osc(X, t, 'triangle', 495, .12, .001, .05); },
+    creak: t => osc(X, t, 'sawtooth', 90, .05, .02, .12, 70, .2),
+    blip: (t, i = 0) => osc(X, t, 'square', 880 + i * 110, .06, .002, .04, null, 0, (i - 2.5) * .15),
+    zip: (t, i = 0) => osc(X, t, 'sawtooth', 200 + i * 45, .06, .004, .08, 700 + i * 90, .12, i % 2 ? .3 : -.3),
+    flag: t => { hiss(X, t, 'bandpass', 1800, 1.5, .2, .01, .06); osc(X, t + .05, 'sine', 1319, .2, .002, .3); osc(X, t + .12, 'sine', 1760, .2, .002, .4); },
+    alarm: t => { osc(X, t, 'square', 1760, .07, .002, .05); osc(X, t + .12, 'square', 1760, .07, .002, .05); },
+    step: t => { osc(X, t, 'sine', 140, .12, .002, .04, 90, .04); hiss(X, t, 'lowpass', 800, 1, .05, .002, .02); },
+    notify: t => { osc(X, t, 'sine', 1319, .25, .002, .25); osc(X, t + .1, 'sine', 1976, .22, .002, .35); },
+    drip: t => osc(X, t, 'sine', 1400, .18, .002, .08, 700, .08),
+  };
+  for (const [t, name, arg] of events) { if (!FX[name]) throw new Error(`groove: unknown sfx "${name}"`); FX[name](T0 + t, arg); }
+  master.gain.setValueAtTime(gain, T0 + dur - 1); master.gain.linearRampToValueAtTime(0, T0 + dur);
+}
+
+window.SCORE = ac => buildGroove(ac, { dur: DUR, bpm: BPM, sections: SECTIONS, events: EVENTS, kit: 'electro', harmony: 'blues', key: 0, gain: .9, sfxGain: 1.0 });
+
+
+// render.mjs seek contract: deterministic frame seek (draw() is pure per the pack contract)
+window.__seek = t => { draw(Math.round(t * FPS)); };
+window.__duration = DUR;
+
+// live preview when opened directly in a browser (render.mjs loads the page with ?render)
+if (!new URLSearchParams(location.search).has('render')) {
+  let start = performance.now();
+  const loop = () => { draw(Math.floor((performance.now() - start) / 1000 * FPS) % FRAMES); requestAnimationFrame(loop); };
+  loop();
+  addEventListener('click', () => { if (!window.SCORE) return; const ac = new AudioContext(); window.SCORE(ac); start = performance.now() + 50; }, { once: true });
+}
+</script>
+</body>
+</html>
