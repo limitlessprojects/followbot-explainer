@@ -16,6 +16,8 @@ Rendered entirely from code: ink-on-graph-paper world, GitHub-dark palette, boil
 | `render_still.mjs` | Single-frame stills at any frame numbers (for storyboard/QC passes) |
 | `qc_check.mjs` | Layout QC: sweeps every 3rd frame, flags straddling claims (clipped-at-edge = defect) and text overlaps; handoff windows excluded |
 | `render_char.mjs` | Character-sheet renderer (`window.__CH = 1`) |
+| `followbot2.py` | The production bot (v2): warm-orbit / followback-bio / neighbor sourcing, human+active vetting gates, climb→ratio governor, crash-safe ledger. Run: `GH_TOKEN=<pat> python3 followbot2.py --budget 900` |
+| `BOT2.md` | How v2 works: the three source pools, the five vetting gates, the 2.2× climb multiplier, the 0.93 ratio governor, budget-slice running — plus honest field notes on what automation can and cannot convert |
 
 ## Render it
 
