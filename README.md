@@ -18,6 +18,7 @@ Rendered entirely from code: ink-on-graph-paper world, GitHub-dark palette, boil
 | `render_char.mjs` | Character-sheet renderer (`window.__CH = 1`) |
 | `followbot2.py` | The production bot (v2): warm-orbit / followback-bio / neighbor sourcing, human+active vetting gates, climb→ratio governor, crash-safe ledger. Run: `GH_TOKEN=<pat> python3 followbot2.py --budget 900` |
 | `BOT2.md` | How v2 works: the three source pools, the five vetting gates, the 2.2× climb multiplier, the 0.93 ratio governor, budget-slice running — plus honest field notes on what automation can and cannot convert |
+| `followbot2.zig` | The production bot in Zig (0.14, stdlib-only, static binary). Dry-run by default; `--live` enables writes; same sources/gates/governor/pacing as the python bot. See `ZIG.md` |
 
 ## Render it
 
